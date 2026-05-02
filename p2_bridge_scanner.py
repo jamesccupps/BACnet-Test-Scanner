@@ -249,25 +249,54 @@ class BACnetClient:
         instance: int,
         progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> list:
-        """Read object-list. Try whole-array first, fall back to indexed read."""
+        """Read object-list. Try whole-array first, fall back to indexed read.
+
+        The whole-array fast path fails on devices with large object lists when
+        the response exceeds the negotiated APDU size — Trane Tracer SC+ is the
+        canonical case (4000+ objects, hits buffer-overflow even at 1024-byte
+        APDUs). When that happens, fall back to reading the array length and
+        then walking individual indices, which always fits.
+        """
         app = self._require()
         oid = ObjectIdentifier(f"device,{instance}")
-        # Fast path
+        # Fast path: whole-array read
         try:
             full = await app.read_property(Address(address), oid, "object-list")
             if progress_cb:
                 progress_cb(len(full), len(full))
             return list(full)
-        except Exception:
+        except Exception as e:
+            # Common reasons: BufferOverflow, segmentation-not-supported, or
+            # the property is too large for the negotiated APDU. Fall through
+            # to indexed reads which always fit.
             pass
-        # Slow path — read length, then walk indices
-        length = await app.read_property(Address(address), oid, "object-list", array_index=0)
-        length = int(length)
+
+        # Slow path — read length first (array_index=0 returns the count),
+        # then walk indices 1..length one at a time.
+        try:
+            length = await app.read_property(
+                Address(address), oid, "object-list", array_index=0
+            )
+            length = int(length)
+        except Exception as exc:
+            raise RuntimeError(
+                f"object-list read failed (whole-array AND indexed length): {exc}"
+            ) from exc
+
+        if progress_cb:
+            progress_cb(0, length)
         results = []
         for i in range(1, length + 1):
-            item = await app.read_property(Address(address), oid, "object-list", array_index=i)
-            results.append(item)
-            if progress_cb:
+            try:
+                item = await app.read_property(
+                    Address(address), oid, "object-list", array_index=i
+                )
+                results.append(item)
+            except Exception:
+                # Skip this index but keep walking — partial results are
+                # better than nothing on a flaky device.
+                pass
+            if progress_cb and (i % 25 == 0 or i == length):
                 progress_cb(i, length)
         return results
 
@@ -278,39 +307,151 @@ class BACnetClient:
         chunk_size: int = 15,
         progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> list[ObjectRow]:
-        """Bulk-read presentValue/objectName/description/units/statusFlags via RPM,
-        in chunks. Falls back to per-property reads if RPM fails for a chunk."""
+        """Bulk-read presentValue/objectName/description/units/statusFlags via RPM.
+
+        Strategy when a chunk fails:
+          1. Halve the chunk size and retry the failed range (handles APDU
+             buffer-overflow on devices that can't fit 15 objects per response).
+          2. If even chunk_size=1 fails, fall back to per-property RP reads
+             for that object (handles devices that don't support RPM at all).
+        """
         app = self._require()
         rows: list[ObjectRow] = []
         addr = Address(address)
         total = len(oids)
         done = 0
 
-        # Properties to fetch per object — keep slim; engineering-units is only
-        # valid on analog objects, status-flags is universal-ish.
-        wanted_common = ["object-name", "description", "present-value", "status-flags", "reliability"]
+        # engineering-units only valid on analog objects
+        wanted_common = ["object-name", "description", "present-value",
+                          "status-flags", "reliability"]
         wanted_analog = wanted_common + ["units"]
 
-        for start in range(0, total, chunk_size):
-            chunk = oids[start:start + chunk_size]
+        async def _try_chunk(chunk: list, sz: int) -> list[ObjectRow]:
+            """RPM with fallback: shrink, then per-property."""
+            if not chunk:
+                return []
             param_list = []
             for oid in chunk:
                 full = _full_type_of(oid)
                 props = wanted_analog if "analog" in full else wanted_common
                 param_list.append((oid, props))
-
-            # Try RPM
             try:
                 results = await app.read_property_multiple(addr, param_list)
-                rows.extend(_rows_from_rpm(chunk, results))
+                return _rows_from_rpm(chunk, results)
             except Exception as e:
-                # fall back to per-property RP
+                emsg = str(e).lower()
+                # Recurse with smaller chunks if we have room to shrink
+                if sz > 1 and ("buffer" in emsg or "overflow" in emsg
+                                or "segment" in emsg or "too large" in emsg
+                                or "apdu" in emsg):
+                    half = max(1, sz // 2)
+                    out: list[ObjectRow] = []
+                    for i in range(0, len(chunk), half):
+                        out.extend(await _try_chunk(chunk[i:i + half], half))
+                    return out
+                # Per-property fallback for this chunk
+                fallback_rows: list[ObjectRow] = []
                 for oid in chunk:
-                    rows.append(await _read_one_object_fallback(app, addr, oid))
+                    fallback_rows.append(
+                        await _read_one_object_fallback(app, addr, oid)
+                    )
+                return fallback_rows
+
+        for start in range(0, total, chunk_size):
+            chunk = oids[start:start + chunk_size]
+            rows.extend(await _try_chunk(chunk, chunk_size))
             done += len(chunk)
             if progress_cb:
                 progress_cb(done, total)
         return rows
+
+    async def read_property_list(self, address: str, oid: Any) -> list[str]:
+        """Read an object's property-list (the 'all properties this object
+        actually has' enumeration). Returns kebab-case property names.
+
+        Some older devices don't implement property-list; in that case we
+        return an empty list and the caller falls back to a hardcoded set.
+        """
+        app = self._require()
+        if not isinstance(oid, ObjectIdentifier):
+            oid = ObjectIdentifier(str(oid))
+        try:
+            props = await app.read_property(Address(address), oid, "property-list")
+            return [_prop_name(p) for p in props]
+        except Exception:
+            return []
+
+    async def read_all_object_properties(
+        self,
+        address: str,
+        oid: Any,
+        chunk_size: int = 8,
+    ) -> list[tuple[str, Any, str]]:
+        """Read every property the object exposes. Returns
+        [(property_name, value_or_None, error_or_empty), ...].
+
+        The standard approach: read property-list to learn what's defined,
+        then RPM the lot in chunks. Falls back to a fixed set of universal
+        properties if property-list is unavailable.
+        """
+        app = self._require()
+        if not isinstance(oid, ObjectIdentifier):
+            oid = ObjectIdentifier(str(oid))
+        addr = Address(address)
+
+        # Always include these — they're either required by ASHRAE or they
+        # show up so often that omitting them would be surprising.
+        always = ["object-identifier", "object-name", "object-type",
+                  "description", "present-value", "status-flags",
+                  "reliability", "out-of-service", "units"]
+
+        # Discover the rest via property-list
+        listed = await self.read_property_list(address, oid)
+        # combine + dedupe while preserving order
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for p in always + listed:
+            if p and p not in seen:
+                seen.add(p)
+                ordered.append(p)
+
+        out: list[tuple[str, Any, str]] = []
+
+        async def _read_chunk(props: list[str]) -> None:
+            if not props:
+                return
+            try:
+                results = await app.read_property_multiple(addr, [(oid, props)])
+            except Exception as e:
+                emsg = str(e).lower()
+                if len(props) > 1 and ("buffer" in emsg or "overflow" in emsg
+                                        or "apdu" in emsg or "segment" in emsg):
+                    mid = len(props) // 2
+                    await _read_chunk(props[:mid])
+                    await _read_chunk(props[mid:])
+                    return
+                # Per-property fallback
+                for p in props:
+                    try:
+                        v = await app.read_property(addr, oid, p)
+                        out.append((p, v, ""))
+                    except Exception as ex:
+                        out.append((p, None, str(ex)))
+                return
+            for tup in results:
+                try:
+                    _oid, prop_id, _idx, value = tup
+                except Exception:
+                    continue
+                err = _is_error_value(value)
+                if err:
+                    out.append((_prop_name(prop_id), None, err))
+                else:
+                    out.append((_prop_name(prop_id), value, ""))
+
+        for i in range(0, len(ordered), chunk_size):
+            await _read_chunk(ordered[i:i + chunk_size])
+        return out
 
 
 def _full_type_of(oid) -> str:
@@ -511,6 +652,7 @@ class ScannerGUI:
         self.current_device: Optional[DiscoveredDevice] = None
         self.object_oids: list = []
         self.rows: list[ObjectRow] = []
+        self._selected_obj_oid: Optional[tuple[str, int]] = None
         self.filter_text = tk.StringVar()
         self.filter_text.trace_add("write", lambda *a: self._refresh_rows_view())
 
@@ -599,11 +741,18 @@ class ScannerGUI:
         self.progress_var = tk.StringVar(value="")
         ttk.Label(obj_actions, textvariable=self.progress_var, foreground="#0050a0").pack(side="right", padx=8)
 
-        # Object list
-        obj_frame = ttk.LabelFrame(self.root, text="Objects")
-        obj_frame.pack(fill="both", expand=True, **pad)
+        # Object area: split horizontally — list on left, property tree on right.
+        # Click an object on the left and the right pane fills with its full
+        # property set (YABE-style).
+        obj_outer = ttk.Frame(self.root)
+        obj_outer.pack(fill="both", expand=True, **pad)
+        obj_paned = ttk.PanedWindow(obj_outer, orient="horizontal")
+        obj_paned.pack(fill="both", expand=True)
+
+        # Left: object list
+        obj_frame = ttk.LabelFrame(obj_paned, text="Objects")
         ocols = ("type", "instance", "name", "value", "units", "flags", "reliability", "description")
-        widths = (50, 70, 240, 110, 80, 130, 140, 280)
+        widths = (50, 70, 220, 100, 70, 110, 110, 220)
         self.obj_tree = ttk.Treeview(obj_frame, columns=ocols, show="headings")
         for c, w in zip(ocols, widths):
             self.obj_tree.heading(c, text=c.title())
@@ -612,9 +761,35 @@ class ScannerGUI:
         obj_sb = ttk.Scrollbar(obj_frame, orient="vertical", command=self.obj_tree.yview)
         obj_sb.pack(side="right", fill="y")
         self.obj_tree.configure(yscrollcommand=obj_sb.set)
-        # color rows in fault state
         self.obj_tree.tag_configure("fault", background="#ffe6e6")
         self.obj_tree.tag_configure("error", background="#ffd0d0", foreground="#660000")
+        self.obj_tree.bind("<<TreeviewSelect>>", self._on_object_selected)
+        obj_paned.add(obj_frame, weight=3)
+
+        # Right: property tree for the selected object
+        prop_frame = ttk.LabelFrame(obj_paned, text="Object properties")
+        prop_actions = ttk.Frame(prop_frame)
+        prop_actions.pack(fill="x", padx=4, pady=2)
+        self.prop_label_var = tk.StringVar(value="(select an object on the left)")
+        ttk.Label(prop_actions, textvariable=self.prop_label_var,
+                  foreground="#0050a0").pack(side="left")
+        self.refresh_props_btn = ttk.Button(
+            prop_actions, text="Refresh", width=8,
+            command=self._on_refresh_object_props, state="disabled",
+        )
+        self.refresh_props_btn.pack(side="right", padx=2)
+        pcols = ("property", "value")
+        self.prop_tree = ttk.Treeview(prop_frame, columns=pcols, show="headings")
+        self.prop_tree.heading("property", text="Property")
+        self.prop_tree.heading("value", text="Value")
+        self.prop_tree.column("property", width=180, anchor="w")
+        self.prop_tree.column("value", width=320, anchor="w")
+        self.prop_tree.pack(fill="both", expand=True, side="left")
+        prop_sb = ttk.Scrollbar(prop_frame, orient="vertical", command=self.prop_tree.yview)
+        prop_sb.pack(side="right", fill="y")
+        self.prop_tree.configure(yscrollcommand=prop_sb.set)
+        self.prop_tree.tag_configure("error", foreground="#aa0000")
+        obj_paned.add(prop_frame, weight=2)
 
         # Status
         status_frame = ttk.LabelFrame(self.root, text="Log")
@@ -759,6 +934,15 @@ class ScannerGUI:
         self.current_device = self.devices[idx]
         d = self.current_device
         self._set_info(f"Reading properties for device {d.instance} @ {d.address}…\n")
+        # Reset object pane state — old object list / props are for the
+        # previous device.
+        self.object_oids = []
+        self.rows = []
+        self._selected_obj_oid = None
+        self._refresh_rows_view()
+        self._set_prop_tree([("(select an object on the left)", "", "")])
+        self.prop_label_var.set("(select an object on the left)")
+        self.refresh_props_btn.configure(state="disabled")
         self.load_objs_btn.configure(state="normal")
         self.read_pvs_btn.configure(state="disabled")
         self._submit(
@@ -854,6 +1038,12 @@ class ScannerGUI:
         self.read_pvs_btn.configure(state="normal")
         self.export_btn.configure(state="normal")
 
+        # Auto-RPM the values in the background. The user already clicked
+        # "Load object list"; making them click again to fill in the value
+        # column is a UX miss. The button stays available for manual refreshes.
+        if self.object_oids:
+            self._on_read_all_values()
+
     def _on_read_all_values(self) -> None:
         if not self.current_device or not self.object_oids:
             return
@@ -904,6 +1094,97 @@ class ScannerGUI:
         )
         self.progress_var.set(f"done — {elapsed:.1f}s, {fault_n} fault, {err_n} errors")
         self._refresh_rows_view()
+
+    # --- Object selection: full property tree on the right pane ---
+
+    def _on_object_selected(self, event=None) -> None:
+        sel = self.obj_tree.selection()
+        if not sel:
+            return
+        item = self.obj_tree.item(sel[0], "values")
+        if not item or len(item) < 3:
+            return
+        # the visible columns: type, instance, name, value, units, flags, reliab, desc
+        try:
+            inst = int(item[1])
+        except (TypeError, ValueError):
+            return
+        # Find the matching ObjectRow to recover the full type
+        match = None
+        for r in self.rows:
+            if r.instance == inst and r.obj_type == item[0]:
+                match = r
+                break
+        if match is None:
+            return
+        self._selected_obj_oid = (match.obj_type_full, match.instance)
+        self.prop_label_var.set(
+            f"{match.obj_type} {match.instance}"
+            + (f" — {match.name}" if match.name else "")
+        )
+        self.refresh_props_btn.configure(state="disabled")
+        self._set_prop_tree([("(loading…)", "", "")])
+        self._fetch_props_for(match)
+
+    def _on_refresh_object_props(self) -> None:
+        if not self._selected_obj_oid or not self.current_device:
+            return
+        full, inst = self._selected_obj_oid
+        for r in self.rows:
+            if r.obj_type_full == full and r.instance == inst:
+                self.refresh_props_btn.configure(state="disabled")
+                self._set_prop_tree([("(refreshing…)", "", "")])
+                self._fetch_props_for(r)
+                return
+
+    def _fetch_props_for(self, row: ObjectRow) -> None:
+        if not self.current_device:
+            return
+        d = self.current_device
+        oid_str = f"{row.obj_type_full},{row.instance}"
+        # Capture which oid this fetch is for; if the user clicks another
+        # row before this returns, we only display the current one.
+        target_key = (row.obj_type_full, row.instance)
+
+        self._submit(
+            self.client.read_all_object_properties(d.address, oid_str),
+            lambda r, e: self._after_fetch_props(target_key, r, e),
+        )
+
+    def _after_fetch_props(
+        self,
+        target_key: tuple[str, int],
+        results: Optional[list[tuple[str, Any, str]]],
+        err: Optional[BaseException],
+    ) -> None:
+        # If the user has selected a different object since this fetch
+        # started, don't clobber the current view with stale data.
+        if self._selected_obj_oid != target_key:
+            return
+        self.refresh_props_btn.configure(state="normal")
+        if err:
+            self.log(f"property fetch failed: {err}")
+            self._set_prop_tree([("(error)", str(err), "error")])
+            return
+        if not results:
+            self._set_prop_tree([("(no properties returned)", "", "")])
+            return
+        rows: list[tuple[str, str, str]] = []
+        for prop, value, e in results:
+            if e:
+                rows.append((prop, f"<error: {e}>", "error"))
+            else:
+                rows.append((prop, _format_prop_value(value), ""))
+        self._set_prop_tree(rows)
+
+    def _set_prop_tree(self, rows: list[tuple[str, str, str]]) -> None:
+        self.prop_tree.delete(*self.prop_tree.get_children())
+        for prop, val, tag in rows:
+            self.prop_tree.insert(
+                "", "end",
+                values=(prop, val),
+                tags=(tag,) if tag else (),
+            )
 
     # --- View refresh / filter ---
 
@@ -984,6 +1265,34 @@ def _format_pv(v: Any) -> str:
     except Exception:
         pass
     return str(v)
+
+
+def _format_prop_value(v: Any) -> str:
+    """Render a BACnet property value for the property tree.
+
+    Handles common types: floats get 3 decimals, lists print as comma-joined
+    short forms, BACnet StatusFlags/PriorityArray get the same friendly
+    formatting used in the object table, everything else falls back to str().
+    Long values get truncated to keep the column readable.
+    """
+    if v is None:
+        return ""
+    cls = type(v).__name__
+    # Status-flags-shaped objects
+    if cls == "StatusFlags" or "statusflags" in cls.lower():
+        return _format_status_flags(v)
+    if isinstance(v, float):
+        return f"{v:.3f}"
+    if isinstance(v, (list, tuple)):
+        # Lists of ObjectIdentifier or PropertyReference get long fast — show
+        # count + first few entries.
+        items = [_format_prop_value(x) for x in v[:8]]
+        more = "" if len(v) <= 8 else f", … (+{len(v) - 8} more)"
+        return f"[{len(v)}] " + ", ".join(items) + more
+    s = str(v)
+    if len(s) > 240:
+        s = s[:237] + "…"
+    return s
 
 
 def _count_by_type(rows: list[ObjectRow]) -> dict[str, int]:

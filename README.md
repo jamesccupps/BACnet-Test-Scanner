@@ -11,12 +11,18 @@ Single file, no install step beyond `pip`, no config files.
 - Sends Who-Is and lists I-Am responses (instance, source, vendor)
 - For a selected device, reads identifying properties (object-name,
   vendor, model, firmware, segmentation, system status)
-- Reads `object-list` (whole-array fast path, falls back to indexed)
+- Reads `object-list` (whole-array fast path, falls back to indexed walk
+  when the response overflows the negotiated APDU — the canonical case
+  is Trane Tracer SC+ with 4000+ objects)
 - Bulk-reads `object-name`, `description`, `present-value`, `status-flags`,
-  `reliability`, and `units` for every object via ReadPropertyMultiple
+  `reliability`, and `units` for every object via ReadPropertyMultiple,
+  starting **automatically** as soon as the object list finishes loading
 - Decodes `status-flags` to readable labels (`ALARM`/`FAULT`/`OVR`/`OOS`)
 - Highlights faulted points in red so #COM and `COMMUNICATION_FAILURE` are
   obvious
+- **Property tree** (right pane): click any object on the left to see every
+  property it exposes, fetched on demand via property-list discovery + RPM —
+  YABE-style without the YABE
 - Filter box for searching by name/description (e.g. `NODE1.AHU1`)
 - CSV export of the full scan
 
@@ -36,10 +42,28 @@ python p2_bridge_scanner.py
 2. **Who-Is** — leave Target blank for local broadcast, or enter the bridge
    host (e.g. `192.168.1.50`) to unicast directly. Click *Who-Is*.
 3. Click the bridge in the discovered devices list — identifying properties
-   load into the right pane.
-4. Click **Load object list** — should match your manifest size.
-5. Click **Read all values (RPM)** — chunks of 15 objects per request.
-   Watch the log for elapsed time and fault count.
+   load into the upper-right pane.
+4. Click **Load object list** — RPM auto-fires once the list is in, so the
+   Value/Units/Flags/Reliability columns populate without a second click.
+   The button stays available for manual refreshes.
+5. Click any object row to see its full property set in the right pane.
+   *Refresh* re-reads just that object.
+
+## Robustness against large devices
+
+Two cases the scanner handles automatically:
+
+- **Buffer overflow on object-list reads.** Trane Tracer SC+ (and any other
+  device whose object list exceeds the APDU MTU) will reject a
+  whole-array read with `buffer-overflow`. The scanner falls back to reading
+  the array length first and walking individual indices, which always fits.
+- **Buffer overflow on RPM chunks.** If a 15-object RPM exceeds the APDU,
+  the chunk gets halved and retried — recursively down to chunks of 1.
+  Only after `chunk_size=1` still fails does it fall back to per-property
+  reads.
+
+Both fallbacks are silent in the UI; the log line afterward shows total
+elapsed time and any per-object errors.
 
 ## What to verify against the P2 bridge
 
