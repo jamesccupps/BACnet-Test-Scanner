@@ -1,5 +1,9 @@
 # P2 Bridge BACnet Scanner
 
+[![CI](https://github.com/jamesccupps/BACnet-Test-Scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/jamesccupps/BACnet-Test-Scanner/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
 A lightweight read-only BACnet/IP scanner with a Tkinter GUI, built on
 [bacpypes3](https://github.com/JoelBender/BACpypes3) — sized for verifying a
 [P2_BACnet_Bridge](https://github.com/jamesccupps/P2_BACnet_Bridge) instance.
@@ -112,6 +116,8 @@ README.md                  — this file
 pip install -r requirements-dev.txt
 pytest
 ```
+
+CI runs the suite on Python 3.10-3.13 across Ubuntu and Windows.
 
 The tests cover the status-flags decoder, which is the piece the rest of the
 UI leans on: rows are highlighted from the decoded string, and the fault count

@@ -13,17 +13,21 @@ Run:  python p2_bridge_scanner.py
 from __future__ import annotations
 
 import asyncio
+import csv
+import logging
 import socket
 import sys
 import threading
 import traceback
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Optional
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+
+log = logging.getLogger("p2_bridge_scanner")
 
 try:
     from bacpypes3.argparse import SimpleArgumentParser
@@ -63,8 +67,9 @@ class AsyncRunner:
     def shutdown(self) -> None:
         try:
             self.loop.call_soon_threadsafe(self.loop.stop)
-        except Exception:
-            pass
+        except RuntimeError as e:
+            # Loop already closed, which happens if shutdown runs twice.
+            log.debug("event loop already stopped: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +181,10 @@ class BACnetClient:
         if self.app is not None:
             try:
                 self.app.close()
-            except Exception:
-                pass
+            except (OSError, RuntimeError, AttributeError) as e:
+                # Nothing useful to do about a failed close, but silence here
+                # hid genuine teardown problems during development.
+                log.warning("error closing the BACnet application: %s", e)
             self.app = None
 
     def _require(self) -> Application:
@@ -271,8 +278,12 @@ class BACnetClient:
         except Exception as e:
             # Common reasons: BufferOverflow, segmentation-not-supported, or
             # the property is too large for the negotiated APDU. Fall through
-            # to indexed reads which always fit.
-            pass
+            # to indexed reads which always fit. Broad on purpose: bacpypes3
+            # raises several unrelated types for these. Logged because "the
+            # scan was slow" and "the fast path silently never works on this
+            # device" look identical from the UI otherwise.
+            log.info("whole-array object-list read failed (%s); "
+                     "falling back to an indexed walk", e)
 
         # Slow path — read length first (array_index=0 returns the count),
         # then walk indices 1..length one at a time.
@@ -289,18 +300,26 @@ class BACnetClient:
         if progress_cb:
             progress_cb(0, length)
         results = []
+        skipped = 0
         for i in range(1, length + 1):
             try:
                 item = await app.read_property(
                     Address(address), oid, "object-list", array_index=i
                 )
                 results.append(item)
-            except Exception:
+            except Exception as e:
                 # Skip this index but keep walking — partial results are
-                # better than nothing on a flaky device.
-                pass
+                # better than nothing on a flaky device. Broad on purpose:
+                # bacpypes3 surfaces device rejections as several unrelated
+                # types. Logged so a device dropping half its object list is
+                # visible rather than silently short.
+                skipped += 1
+                log.debug("object-list index %d failed: %s", i, e)
             if progress_cb and (i % 25 == 0 or i == length):
                 progress_cb(i, length)
+        if skipped:
+            log.warning("object-list walk: %d of %d indices did not read back",
+                        skipped, length)
         return results
 
     async def read_object_summary(
@@ -381,7 +400,11 @@ class BACnetClient:
         try:
             props = await app.read_property(Address(address), oid, "property-list")
             return [_prop_name(p) for p in props]
-        except Exception:
+        except Exception as e:
+            # Plenty of devices do not implement property-list. An empty list
+            # is the right answer; the reason belongs in the log rather than
+            # being discarded.
+            log.debug("property-list not available for %s: %s", oid, e)
             return []
 
     async def read_all_object_properties(
@@ -444,7 +467,8 @@ class BACnetClient:
             for tup in results:
                 try:
                     _oid, prop_id, _idx, value = tup
-                except Exception:
+                except (TypeError, ValueError) as e:
+                    log.debug("unexpected RPM result shape %r: %s", tup, e)
                     continue
                 err = _is_error_value(value)
                 if err:
@@ -461,7 +485,7 @@ def _full_type_of(oid) -> str:
     """Get the BACnet object-type string from an ObjectIdentifier-like."""
     try:
         ot = oid[0] if isinstance(oid, tuple) else oid.object_type
-    except Exception:
+    except (AttributeError, IndexError, TypeError):
         ot = oid
     s = str(ot)
     # ObjectType enum prints as 'analog-input' or 'ObjectType.analogInput' — normalize
@@ -479,10 +503,11 @@ def _full_type_of(oid) -> str:
 def _instance_of(oid) -> int:
     try:
         return int(oid[1]) if isinstance(oid, tuple) else int(oid.instance)
-    except Exception:
+    except (AttributeError, IndexError, TypeError, ValueError):
         try:
             return int(str(oid).rsplit(",", 1)[-1])
-        except Exception:
+        except (IndexError, ValueError):
+            log.debug("could not extract an instance number from %r", oid)
             return -1
 
 
@@ -517,7 +542,8 @@ def _rows_from_rpm(oids: list, rpm_results: Any) -> list[ObjectRow]:
     for tup in rpm_results:
         try:
             oid, prop_id, array_idx, value = tup
-        except Exception:
+        except (TypeError, ValueError) as e:
+            log.debug("unexpected RPM result shape %r: %s", tup, e)
             continue
         full = _full_type_of(oid)
         inst = _instance_of(oid)
@@ -630,15 +656,17 @@ async def _read_one_object_fallback(app: Application, addr: Address, oid: Any) -
 
 def _detect_local_ip() -> str:
     """Best-effort detection of the outbound IPv4 address."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.3)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
+        sock.settimeout(0.3)
+        # No packet is sent; connect() on UDP just picks the outbound route.
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError as e:
+        log.debug("could not detect the local IP: %s", e)
         return "0.0.0.0"
+    finally:
+        sock.close()
 
 
 class ScannerGUI:
@@ -1230,7 +1258,6 @@ class ScannerGUI:
         if not path:
             return
         try:
-            import csv
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 w.writerow(["type", "instance", "name", "present_value", "units",
@@ -1241,7 +1268,8 @@ class ScannerGUI:
                         r.units, r.status_flags, r.reliability, r.description, r.error,
                     ])
             self.log(f"Exported {len(self.rows)} rows to {path}")
-        except Exception as e:
+        except (OSError, csv.Error, UnicodeEncodeError) as e:
+            log.error("CSV export to %s failed: %s", path, e)
             messagebox.showerror("Export failed", str(e))
 
     # --- Shutdown ---
@@ -1252,8 +1280,13 @@ class ScannerGUI:
                 fut = self.runner.submit(self.client.stop())
                 try:
                     fut.result(timeout=2)
+                except FutureTimeoutError:
+                    log.warning("BACnet stack did not shut down within 2s; "
+                                "closing anyway")
                 except Exception:
-                    pass
+                    # The coroutine itself raised. Closing regardless, but the
+                    # traceback belongs in the log rather than nowhere.
+                    log.exception("error while stopping the BACnet stack")
         finally:
             self.runner.shutdown()
             self.root.destroy()
@@ -1262,11 +1295,10 @@ class ScannerGUI:
 def _format_pv(v: Any) -> str:
     if v is None:
         return ""
-    try:
-        if isinstance(v, float):
-            return f"{v:.3f}"
-    except Exception:
-        pass
+    if isinstance(v, float):
+        # Guarded by a try/except before; isinstance and %f formatting of a
+        # float cannot raise, so the handler only obscured the intent.
+        return f"{v:.3f}"
     return str(v)
 
 
@@ -1307,20 +1339,44 @@ def _count_by_type(rows: list[ObjectRow]) -> dict[str, int]:
 
 # ---------------------------------------------------------------------------
 
+def _configure_logging(argv: list[str]) -> None:
+    """Send diagnostics to stderr.
+
+    The GUI log pane shows what the operator needs; this is the other half —
+    the reasons behind a fallback, a skipped object-list index, a device that
+    does not implement property-list. Those used to be discarded, which made
+    "this device is slow" and "the fast path never works here" look identical.
+
+    -v / --verbose turns on DEBUG, which includes per-object detail.
+    """
+    verbose = any(a in ("-v", "--verbose") for a in argv)
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    if not verbose:
+        # bacpypes3 is chatty at DEBUG and it is not our output.
+        logging.getLogger("bacpypes3").setLevel(logging.WARNING)
+
+
 def main() -> int:
+    _configure_logging(sys.argv[1:])
+    log.info("P2 Bridge BACnet Scanner starting")
     root = tk.Tk()
     try:
         root.tk.call("tk", "scaling", 1.2)
-    except Exception:
-        pass
+    except tk.TclError as e:
+        log.debug("could not set Tk scaling: %s", e)
     try:
         style = ttk.Style()
         if "vista" in style.theme_names():
             style.theme_use("vista")
         elif "clam" in style.theme_names():
             style.theme_use("clam")
-    except Exception:
-        pass
+    except tk.TclError as e:
+        # Cosmetic only; the default theme is perfectly usable.
+        log.debug("could not apply a ttk theme: %s", e)
     ScannerGUI(root)
     try:
         root.mainloop()
