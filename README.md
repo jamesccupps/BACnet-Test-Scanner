@@ -100,9 +100,25 @@ expose BBMD, so a routable host or a multi-homed scanner is the path.
 
 ```
 p2_bridge_scanner.py       — single-file GUI + bacpypes3 wrapper
+tests/test_status_flags.py — status-flags decoding and its edge cases
 requirements.txt           — bacpypes3
+requirements-dev.txt       — adds pytest
 README.md                  — this file
 ```
+
+## Development
+
+```
+pip install -r requirements-dev.txt
+pytest
+```
+
+The tests cover the status-flags decoder, which is the piece the rest of the
+UI leans on: rows are highlighted from the decoded string, and the fault count
+in the summary line is derived from it. Decoding those four bits by attribute
+name does not work — bacpypes3 exposes `StatusFlags.fault` and `.overridden`
+as bit-position constants rather than per-instance values, so reading them
+that way reports a fault on every point. They are read positionally.
 
 ## Notes
 
@@ -115,3 +131,7 @@ README.md                  — this file
 - RPM chunk size is 15 by default. Bridges with very long object names may
   need a smaller chunk; edit `chunk_size` in `read_object_summary` if you
   hit APDU size errors.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

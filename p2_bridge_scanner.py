@@ -114,37 +114,40 @@ def _short_type(full: str) -> str:
 
 
 def _format_status_flags(sf: Any) -> str:
-    """Render a bacpypes3 StatusFlags as 'IF.OS.OV.OO' style string."""
+    """Render a BACnetStatusFlags bit string as '0100 FAULT' style text.
+
+    Read the bits positionally. bacpypes3 exposes `StatusFlags.fault` and
+    `.overridden` as class-level BIT POSITION constants (1 and 2), not as the
+    value of that bit on this instance, so `getattr(sf, "fault")` returns a
+    truthy 1 on every object regardless of its actual state. `in_alarm` and
+    `out_of_service` are not exposed under those names at all.
+
+    Reading them by attribute therefore reported FAULT and OVR on every single
+    point, which turned every row pink and made the fault count equal the
+    object count — the tool could not tell a healthy bridge from a broken one,
+    which is the one thing it exists to do.
+
+    Bit order per ASHRAE 135: in-alarm, fault, overridden, out-of-service.
+    """
+    _LABELS = ("ALARM", "FAULT", "OVR", "OOS")
+    # A str is subscriptable, so an error value like 'communicationFailure'
+    # would index character by character and come out as all four flags set.
+    # Require something that yields ints, which a real bit string does.
+    if isinstance(sf, (str, bytes, bytearray)) or sf is None:
+        return ""
     try:
-        # bacpypes3 StatusFlags is a BitString-like; iterate or str() it
-        # bits are: in-alarm, fault, overridden, out-of-service
-        bits = []
-        for name in ("in-alarm", "fault", "overridden", "out-of-service"):
-            try:
-                v = getattr(sf, name.replace("-", "_"))
-            except Exception:
-                v = None
-            if v is None:
-                # fall back to indexing
-                try:
-                    idx = ("in-alarm", "fault", "overridden", "out-of-service").index(name)
-                    v = bool(sf[idx])
-                except Exception:
-                    v = "?"
-            bits.append("1" if v else "0")
-        flags = "".join(bits)
-        labels = []
-        if flags[0] == "1":
-            labels.append("ALARM")
-        if flags[1] == "1":
-            labels.append("FAULT")
-        if flags[2] == "1":
-            labels.append("OVR")
-        if flags[3] == "1":
-            labels.append("OOS")
-        return f"{flags} {','.join(labels)}" if labels else flags
-    except Exception:
-        return str(sf)
+        raw = [sf[i] for i in range(4)]
+        if not all(isinstance(b, (bool, int)) for b in raw):
+            return ""
+        bits = "".join("1" if b else "0" for b in raw)
+    except (TypeError, IndexError, KeyError, AttributeError):
+        # Unknown is NOT the same as "everything is in alarm". The previous
+        # version used the string "?" as its unknown sentinel and then tested
+        # it for truthiness, so a missing or errored status-flags rendered as
+        # 1111 ALARM,FAULT,OVR,OOS.
+        return ""
+    labels = [lbl for bit, lbl in zip(bits, _LABELS) if bit == "1"]
+    return f"{bits} {','.join(labels)}" if labels else bits
 
 
 class BACnetClient:
