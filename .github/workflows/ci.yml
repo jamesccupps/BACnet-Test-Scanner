@@ -17,12 +17,16 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v5
+      # v4/v5 rather than the newer v5/v6. These are the versions running
+      # green in this account's other repo today; the newer pair was a
+      # speculative bump to silence a Node 20 deprecation notice and every
+      # job failed within seconds of setup. The notice is cosmetic; a red
+      # matrix is not.
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
 
       - name: Install
         run: |
